@@ -139,10 +139,35 @@ async def execute_commands(commands_text, channel):
         elif command == "propose_dice":
             parts = args_str.split(' ', 3)
             if len(parts) >= 4:
-                p_name, stat_name, diff_level, action_desc = parts[0], parts[1].upper(), parts[2].lower(), parts[3]
+                p_names_str, stat_name, diff_level, action_desc = parts[0], parts[1].upper(), parts[2].lower(), parts[3]
                 
-                player_data = db["players"].get(p_name, {})
-                base_stat = player_data.get("stats", {}).get(stat_name, 10)
+                # 余計な引用符（ハルシネーション）を徹底排除
+                action_desc = action_desc.replace('"', '').replace("'", "").strip()
+                
+                # 協力行動（カンマ区切り）の解析ロジック
+                p_names = [p.strip() for p in p_names_str.split(',')]
+                base_stat = 0
+                valid_p_names = []
+                
+                for p in p_names:
+                    if p in db["players"]:
+                        valid_p_names.append(p)
+                        p_stat = db["players"][p]["stats"].get(stat_name, 10)
+                        if isinstance(p_stat, (int, float)) and p_stat > base_stat:
+                            base_stat = p_stat
+                
+                # 万が一、プレイヤー名やステータス名が崩壊していた場合のセーフティ
+                if not valid_p_names:
+                    valid_p_names = list(db["players"].keys())[:1]
+                    base_stat = 10
+                if stat_name not in ["STR", "INT", "DEX"]:
+                    stat_name = "STR"
+                
+                # 協力行動ボーナス：高い方の能力値をベースにし、人数に応じてプラス補正 (+3)
+                coop_bonus = 0
+                if len(valid_p_names) > 1:
+                    coop_bonus = 3 
+                    base_stat += coop_bonus
                 
                 if diff_level == "easy":
                     target_val = min(base_stat * 5, 95)
@@ -154,18 +179,21 @@ async def execute_commands(commands_text, channel):
                     target_val = max(min(base_stat * 3, 90), 10)
                     diff_str = "普通 (能力値×3)"
                 
+                display_p_name = ", ".join(valid_p_names)
                 db["session"]["pending_dice"] = {
-                    "player": p_name,
+                    "player": display_p_name,
                     "stat": stat_name,
                     "target": target_val,
                     "description": action_desc
                 }
                 write_db(db)
                 
+                coop_str = f"🤝 **【協力行動ボーナス適用！】** (能力値ベースに補正 +{coop_bonus})\n" if coop_bonus > 0 else ""
                 confirm_msg = (
                     f"⚠️ **【ダイス判定の確認】**\n"
-                    f"**{p_name}** の「{action_desc}」の判定を提案します。\n\n"
-                    f"🎲 使用ステータス: **{stat_name}** (能力値: {base_stat})\n"
+                    f"**{display_p_name}** の「{action_desc}」の判定を提案します。\n\n"
+                    f"{coop_str}"
+                    f"🎲 使用ステータス: **{stat_name}** (基準能力値: {base_stat})\n"
                     f"🧭 判定難易度: {diff_str}\n"
                     f"🎯 成功条件: **{target_val} 以下** (1d100)\n\n"
                     f"本当に実行する場合は **`!実行`** とチャットしてください。\n"
@@ -197,12 +225,20 @@ def call_gemini_gm(player_messages, db_snapshot):
     1. あなたが過去に出力した描写、開示したアイテム、部屋に存在するオブジェクトの情報は、渡される `log_history` および `current_event` に完全に同期していなければなりません。「さっき見つかったと描写したアイテム」を、次のターンで「存在しない」などと言って矛盾を起こすことは絶対に許されません。
     2. 新しい部屋に進んだ時は必ず `!set current_event.title <部屋名>`, `!set current_event.description <状況説明>`, `!set current_event.truth <部屋の隠された真相や隠しアイテムの場所>` を実行し、データを同期してください。
     3. リスクのない単なる「部屋の観察」「落ちているものを調べる」行動には、絶対にダイスを要求せず、!chat gm で結果を即座に開示してください。
-    4. プレイヤー全員が一通り行動を終えた、または大きなアクションを1回起こしたと判断した場合、必ず `!sub session.turn_left 1` を出力して部屋のリミットを1減らしてください。
-    5. ターンリミット（session.turn_left）が 0 になった場合、!chat gm で「部屋の罠の発動」や「モンスターの奇襲」を発生させ、プレイヤーのHPに固定ダメージ（!sub players.名前.stats.HP 3 など）を与えた上で、強制的に状況を変化させて物語を進めてください。
+    4. プレイヤー全員が一通り行動を終えた、または大きなアクションを1回起こしたと判断した場合、必ず `!sub session.turn_left 1` を出力して部屋のリミットを1減らしてください。システム側は自動でターンを減らしません。あなた自身がカウントをコントロールしてください。
+    5. ターンリミット（session.turn_left）が 0 になった場合、!chat gm で「部屋の罠の発動」や「モンスターの奇襲」を発生させ、プレイヤーのHPに固定ダメージ（!sub players.名前.stats.HP 3 など）を与えた上で、強制的に状況を変化させて物語を進めてください。手詰まりのまま放置してはなりません。
 
     # 重要ルール：ダイス判定の事前確認
-    プレイヤーがダイスロールの必要性がある行動（例：攻撃する、罠を解除する、隠し扉を探すなど）を選択した場合、あなた自身が勝手に結果を描写したり、即座にダイスを振らせてはいけません。
-    必ず、以下の `!propose_dice` コマンドを使用して、プレイヤーに難易度と条件を提示し、実行するか確認してください。
+    1. プレイヤーがダイスロールの必要性がある行動（例：攻撃する、罠を解除する、隠し扉を探すなど）を選択した場合、あなた自身が勝手に結果を描写したり、即座にダイスを振らせてはいけません。
+    2. 必ず、以下の `!propose_dice` コマンドを使用して、プレイヤーに難易度と条件を提示し、実行するか確認してください。
+       書式: `!propose_dice <プレイヤー名> <STR|INT|DEX> <easy|normal|hard> <行動の短い要約>`
+    3. 第4引数の「行動の短い要約」には、絶対に引用符（"や'）を含めたり、成功・失敗時の描写を詰め込んだりしないでください。シンプルに「瓦礫をどかす」のように1フレーズで書くこと。
+    4. 複数人で協力している場合は、プレイヤー名をカンマで繋いでください（例: `asanebou_benk,kimuchi_1224`）。
+    5. ステータス名には必ず `STR`, `INT`, `DEX` のいずれか3文字のみを指定してください。プレイヤー名などを入れてはなりません。
+
+    # 交渉・アイデアへの柔軟な裁量（重要）
+    - プレイヤーが「二人で協力する」「道具を使う」「もっともな作戦を提案する」など、難易度が下がるべき交渉や提案をしてきた場合、再度ダイスを振らせるのではなく、**ダイスを免除して即座に自動成功**として扱い、`!chat gm` で気持ちよく成功描写を行ってストーリーを進めて構いません。
+    - プレイヤーとのチャットによる「難易度緩和の問答」に何度も付き合ってゲームを停滞させないよう、スマートに自動成功へ導いてください。
 
     # プレイヤーの職業とスキルの一貫性
     - データベース（DB）に記載されている各プレイヤーの `class` と `skills` を絶対に勝手に変更したり、別の名前に書き換えて描写したりしないでください。DBの情報が絶対の正義です。
@@ -262,7 +298,7 @@ async def on_message(message):
     
     if msg == "!reset":
         init_db(force=True)
-        await message.channel.send("🧹 `System: ゲームデータを完全にリセットしました。ロビーに戻ります。`")
+        await message.channel.send("🧹 `System: ゲームデータを完全にリセットしました。`")
         return
 
     db = get_db_snapshot()
@@ -285,6 +321,7 @@ async def on_message(message):
         db["session"]["pending_dice"] = None
         write_db(db)
         
+        # ── システム側では自動でターンを減らさない ──
         if is_success:
             llm_output = call_gemini_gm([f"システム通知: プレイヤー {pending['player']} の「{pending['description']}」の判定結果は 出目{roll} で 【成功】 でした。次の展開や部屋の状況変化、アイテム発見などの描写を出力してください。"], db)
             if llm_output:
@@ -307,8 +344,8 @@ async def on_message(message):
             await message.channel.send("⚠️ `System: 現在はキャラクター作成フェーズではありません。`")
             return
         
-        # 全角スペース、全角コロンを半角に統一してパースの崩れを防止
-        raw_input = msg.replace("!キャラ作成", "").replace(" ", " ").replace("：", ":").strip()
+        # 【全角修正】全角スペース、全角コロンを半角に完全に統一してパース崩れを防止
+        raw_input = msg.replace("!キャラ作成", "").replace("　", " ").replace(" ", " ").replace("：", ":").strip()
         
         job_name = "冒険者"
         skill_name = "未覚醒"
@@ -353,10 +390,7 @@ async def on_message(message):
         if status != "character_creation":
             await message.channel.send("⚠️ `System: 参加者が1人以上キャラ作成を完了した状態で !ゲーム開始 を宣言してください。`")
             return
-        db["session"]["status"] = "playing"
-        db["session"]["stage_count"] = 1
-        db["session"]["turn_left"] = 4
-        db["session"]["log_history"] = [] # 履歴の初期化
+        db["session"].update({"status": "playing", "stage_count": 1, "turn_left": 4, "log_history": []})
         write_db(db)
         await message.channel.send("⚔️ `System: 運命の歯車が回り出した。ゲームを開始します…`")
         message_queue.append(f"システム通知: ゲームが開始されました。ステージ1の最初の部屋の描写を始めてください。必ず!set current_event.title などを実行し、『埃をかぶった木箱』『古い棚』『不自然な石の窪み』など、探索可能な具体的オブジェクトを最低3つ明文化して含めてください。")
