@@ -30,14 +30,13 @@ def get_default_db():
     return {
         "session": {
             "stage_count": 0,
-            "status": "setup",
-            "log_history": [],
-            "pending_dice": None  # 確認待ちのダイス情報を格納
+            "status": "setup", # setup -> character_creation -> playing -> gameover/clear
+            "log_history": []
         },
         "players": {},
         "current_event": {
             "title": "ロビー",
-            "description": "ゲームが初期化されました。`!キャラ作成 [希望の役職]` と発言して参加してください。\n全員の作成が終わったら `!ゲーム開始` と発言してください。",
+            "description": "ゲームが初期化されました。`!キャラ作成 [希望の役職]` と発言して参加してください。（例: !キャラ作成 魔法使い）\n全員の作成が終わったら `!ゲーム開始` と発言してください。",
             "truth": "なし",
             "status": "resolved"
         }
@@ -81,6 +80,7 @@ async def execute_commands(commands_text, channel):
             speaker = sub_args[0].upper()
             msg = sub_args[1] if len(sub_args) > 1 else ""
             
+            # ステージ可視化ヘッダーを自動付与
             if stage > 0:
                 header = f"━ [{speaker}] ━━━━━━━━━━\n📍 **STAGE {stage}/20 : {event_title}**\n━━━━━━━━━━━━━━━━━━\n"
             else:
@@ -88,6 +88,7 @@ async def execute_commands(commands_text, channel):
             await channel.send(f"{header}{msg}")
             
         elif command in ["set", "add", "sub"]:
+            # 内部データの更新処理（ドット記法簡易版）
             sub_args = args_str.split(' ', 1)
             path, val = sub_args[0], sub_args[1]
             if val.isdigit(): val = int(val)
@@ -102,31 +103,23 @@ async def execute_commands(commands_text, channel):
             elif command == "sub": current[keys[-1]] = current.get(keys[-1], 0) - val
             write_db(db)
             
-        elif command == "propose_dice":
-            # !propose_dice Yamada STR 14 鉄の扉を力任せにこじ開ける
-            parts = args_str.split(' ', 3)
-            if len(parts) >= 4:
-                p_name, stat_name, target_val, action_desc = parts[0], parts[1], int(parts[2]), parts[3]
+        elif command == "req_dice":
+            # !req_dice Yamada STR 14 のような形式
+            parts = args_str.split(' ')
+            if len(parts) >= 3:
+                p_name, stat_name, target_val = parts[0], parts[1], int(parts[2])
+                roll = random.randint(1, 100)
+                is_success = roll <= target_val
+                result_str = "【成功】" if is_success else "【失敗】"
                 
-                # 確認待ちダイスとしてDBに一時保存
-                db["session"]["pending_dice"] = {
-                    "player": p_name,
-                    "stat": stat_name,
-                    "target": target_val,
-                    "description": action_desc
-                }
-                write_db(db)
+                dice_msg = f"🎲 **{p_name} の {stat_name} 判定** (目標値: {target_val})\n出目: **{roll}** ➡️ **{result_str}**"
+                await channel.send(f"```diff\n{'+ ' if is_success else '- '}{dice_msg}\n```")
                 
-                # プレイヤーへの確認メッセージ
-                confirm_msg = (
-                    f"⚠️ **【ダイス判定の確認】**\n"
-                    f"**{p_name}** が行おうとした「{action_desc}」には成功判定が必要です。\n\n"
-                    f"🎲 使用ステータス: **{stat_name}**\n"
-                    f"🎯 成功条件: **{target_val} 以下** (1d100)\n\n"
-                    f"本当に実行する場合は **`!実行`** とチャットしてください。\n"
-                    f"（取りやめる場合は、別の行動を普通にチャットしてください）"
-                )
-                await channel.send(f"```yaml\n{confirm_msg}\n```")
+                # ダイス結果を即座にLLMに伝えて次の描写を要求するトリガー
+                db = get_db_snapshot()
+                llm_output = call_gemini_gm([f"システム通知: {p_name}の{stat_name}判定ダイスの結果は {roll} で {result_str} でした。この結果に基づくゲーム展開を!chat等で出力してください。"], db)
+                if llm_output:
+                    await execute_commands(llm_output, channel)
 
 # --- Gemini API 接続 ---
 def call_gemini_gm(player_messages, db_snapshot):
@@ -136,64 +129,28 @@ def call_gemini_gm(player_messages, db_snapshot):
     
     stage = db_snapshot["session"]["stage_count"]
     
-    # 1. 現在のステージ数を取得（デフォルトは1）
-    stage = db_snapshot.get("session", {}).get("stage_count", 1)
-    
-    # 2. ステージ数に応じた「難易度勾配指示（メタ・プロンプト）」の動的生成
+    # 難易度勾配の定義
     if stage <= 5:
-        diff_prompt = """
-        【現在の難易度：レベル1（基本・チュートリアル）】
-        - プレイヤーが直感的、かつストレートな行動（戦う、開けるなど）を行えば、基本的には成功、または順当なダイス判定（成功率高め）で突破させてください。
-        - 複雑な裏のギミックや、即死するような罠は絶対に配置しないでください。
-        """
+        diff_prompt = "難易度低。ストレートな行動で突破可能。即死トラップ厳禁。"
     elif stage <= 10:
-        diff_prompt = """
-        【現在の難易度：レベル2（リソース消費とトラップ）】
-        - 単純な力押しだけでは解決できない「罠」や「障害」を導入してください。
-        - 突破にはHPの減少や、アイテムの消費、あるいはリスクを伴うダイス判定を要求してください。
-        ```json
-        """
-    elif stage <= 19:
-        diff_prompt = f"""
-        【現在の難易度：レベル3（水平思考とスキル応用）】
-        - 非常に重要：普通に攻撃したり進もうとすると、絶対に失敗するか大ダメージを受けるイベントを生成してください。
-        - 突破には、プレイヤーが持つ特異スキル（現在：{json.dumps(db_snapshot.get('player_character', {}).get('skills', {}), ensure_ascii=False)}）を意外な形で応用するか、部屋の環境を利用した「水平思考（とんち）」が必要です。
-        - プレイヤーから機転の利いた提案があれば、!set や !chat を用いて、裏の正解（truth）を書き換えながら、ドラマチックに解決させてください。
-        """
+        diff_prompt = "難易度中。罠やHP/アイテムリソースを消費するギミックを導入。"
     else:
-        diff_prompt = """
-        【現在の難易度：レベル4（ステージ20・第1目標ボス戦）】
-        - 20ステージ目の大ボスです。ボスには「特定の弱点」や「特定の行動手順」を裏で設定（truthに明記）してください。
-        - プレイヤーがその弱点を見破る、あるいはこれまでの経験を活かした行動をとるまで、ボスは倒せません。総力戦を描写してください。
-        """
+        diff_prompt = "難易度高。普通に戦うと全滅する。プレイヤーの特異スキルの応用や、部屋の環境を利用した水平思考（とんち）を要求せよ。"
 
-    # 3. メインのシステム指示書（動的指示を埋め込む）
     system_instruction = f"""
-    あなたはテキストローグライクRPGの「ゲームマスター（GM）」兼「システムコントローラー」です。
-    あなたは人間に対して自然言語で直接返答してはなりません。あなたの出力は、すべて以下に定義する「!」から始まるコマンド言語のみで構成されなければなりません。
+    あなたはテキストローグライクRPGのゲームマスター(GM)です。返答は「!」から始まるシステムコマンドのみで行ってください。
 
-    # 動作原則
+    # ルール
     1. 1ステージは「1つの部屋規模の探索スペース」としてコンパクトに定義せよ。
     2. 新しい部屋（ステージ）に進む際は、!set current_event.title [部屋名] と !set current_event.description [描写] を行い、!set current_event.truth に「裏の正解やギミック、ペナルティ」を明確に記述せよ。
-    3. パーティプレイ対応：複数のプレイヤー情報がデータベースにあります。行動を宣言したプレイヤーの名前を正しく認識してジャッジせよ。
-    4. 介入の閾値: プレイヤーが単なる雑談をしている場合は、何も出力してはならない（空文字）。プレイヤーが「ゲーム開始」「行動」「探索」「NPCへの会話」を行った時のみコマンドを出力せよ。
-    5. PCへの不干渉: プレイヤーキャラクター(PC)のセリフや行動、心理をあなたが勝手に描写してはならない。
+    3. 行動判定が必要な場合、あなた自身がダイスを振るのではなく、必ず「!req_dice [プレイヤー名] [ステータス名] [目標値]」コマンドを出力してシステムにダイスを要求せよ。目標値はプレイヤーのステータス（1〜20程度）を基準に決定せよ。
+    4. パーティプレイ対応：複数のプレイヤー情報がデータベースにあります。行動を宣言したプレイヤーの名前を正しく認識してジャッジせよ。
 
-    # 重要ルール：ダイス判定の事前確認
-    プレイヤーがダイスロールの必要性がある行動（例：攻撃する、罠を解除する、隠し扉を探すなど）を選択した場合、あなた自身が勝手に結果を描写したり、即座にダイスを振らせてはいけません。
-    必ず、以下の `!propose_dice` コマンドを使用して、プレイヤーに難易度と条件を提示し、実行するか確認してください。
-
-    # 出力コマンド仕様
-    - !chat <送信先(gmまたはnpc名)> <メッセージ> : DiscordにGMの描写やNPCのセリフを送信する。
-    - !propose_dice <プレイヤー名> <ステータス> <目標値> <行動内容の要約> : ダイス判定の条件をプレイヤーに提示して確認を求める。目標値はプレイヤーのステータス（6〜18程度）を基準に設定すること。
-    - !set <JSONパス> <値> : JSONデータベースの値を書き換える。
-    - !add / !sub <JSONパス> <数値> : 数値の増減。
-    - !new <対象> <設定オブジェクト> : current_event を新しいイベント（謎、戦闘、罠、店など）で上書きする。
-
-    # ゲーム進行ルール
-    - プレイヤーが「開始」と言ったら、!set でランダムな能力値（STR, INT, DEXなど）と、役職（戦士、魔法使い、僧侶、学者など）に応じた『●を●する能力』という形式の特異スキルを決定し、!chat で世界観を導入せよ。
-    - 各イベント生成（!new）時は、必ず具体的な「解法（真相・truth）」を内部データに明記すること。
-
+    # 出力コマンド
+    - !chat gm <メッセージ> : GMの描写やNPCのセリフ
+    - !req_dice <プレイヤー名> <ステータス> <目標値> : ダイス判定をシステムに要求
+    - !set / !add / !sub <パス> <値> : データの更新
+    
     現在の難易度方針: {diff_prompt}
     """
 
@@ -207,13 +164,7 @@ def call_gemini_gm(player_messages, db_snapshot):
         )
         return response.text if response.text else ""
     except Exception as e:
-        print(f"Gemini Error: {e}")
-        if "503" in str(e) or "UNAVAILABLE" in str(e):
-            return "!chat system ⚠️ **【システムエラー】** Gemini APIのサービスが混み合っています。時間をおいて再送信してください"
-        # クォータ枯渇や残高不足のエラー(429)を検知した場合のDiscord通知用フェイクコマンドを返す
-        elif "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            return "!chat system ⚠️ **【システムエラー】** Gemini APIの利用制限またはリソースの不足が発生しています。管理者へ連絡してください"
-        return ""
+        print(f"Gemini Error: {e}"); return ""
 
 # --- メッセージキュー処理 ---
 async def process_queue(channel):
@@ -245,7 +196,9 @@ async def on_message(message):
     msg = message.content.strip()
     p_name = message.author.name
     
-    # ── システム直轄コマンド ──
+    # ── システム直轄コマンド（LLMを介さない決定論的処理） ──
+    
+    # 1. 全初期化・リスタート
     if msg == "!reset":
         init_db(force=True)
         await message.channel.send("🧹 `System: ゲームデータを完全にリセットしました。ロビーに戻ります。`")
@@ -254,65 +207,53 @@ async def on_message(message):
     db = get_db_snapshot()
     status = db["session"]["status"]
 
-    # 確定ダイスの実行コマンド
-    if msg == "!実行" and status == "playing":
-        pending = db["session"].get("pending_dice")
-        if not pending:
-            await message.channel.send("⚠️ `System: 現在確認待ちのダイス判定はありません。`")
-            return
-        
-        # ダイスを振る
-        roll = random.randint(1, 100)
-        target = pending["target"]
-        is_success = roll <= target
-        result_str = "【成功】" if is_success else "【失敗】"
-        
-        dice_msg = f"🎲 **{pending['player']} の {pending['stat']} 判定** (目標値: {target})\n出目: **{roll}** ➡️ **{result_str}**"
-        await message.channel.send(f"```diff\n{'+ ' if is_success else '- '}{dice_msg}\n```")
-        
-        # 確認待ち状態をクリア
-        db["session"]["pending_dice"] = None
-        write_db(db)
-        
-        # 結果をLLMにフィードバック
-        llm_output = call_gemini_gm([f"システム通知: プレイヤー {pending['player']} が提案を承認し、ダイスを実行しました。「{pending['description']}」の判定結果は 出目{roll} で {result_str} でした。この結果に基づくその後の部屋の展開・描写を出力してください。"], db)
-        if llm_output:
-            await execute_commands(llm_output, message.channel)
-        return
-
+    # 2. キャラクター作成フェーズ
     if msg.startswith("!キャラ作成"):
         if status != "setup" and status != "character_creation":
             await message.channel.send("⚠️ `System: 現在はキャラクター作成フェーズではありません。`")
             return
+        
         job = msg.replace("!キャラ作成", "").strip()
         if not job: job = "冒険者"
         
-        stats = {"HP": 20, "STR": random.randint(6, 18), "INT": random.randint(6, 18), "DEX": random.randint(6, 18)}
-        db["players"][p_name] = {"class": job, "skills": {"name": "未覚醒", "effect": "ゲーム開始時にLLMにより決定されます"}, "stats": stats}
+        # パラメータのランダム決定 (3d6方式換算、1〜18)
+        stats = {
+            "HP": 20,
+            "STR": random.randint(6, 18),
+            "INT": random.randint(6, 18),
+            "DEX": random.randint(6, 18)
+        }
+        
+        db["players"][p_name] = {
+            "class": job,
+            "skills": {"name": "未覚醒", "effect": "ゲーム開始時にLLMにより決定されます"},
+            "stats": stats
+        }
         db["session"]["status"] = "character_creation"
         write_db(db)
+        
         await message.channel.send(f"🎲 **{p_name}** が **{job}** としてエントリーしました！\n能力値: `STR:{stats['STR']} / INT:{stats['INT']} / DEX:{stats['DEX']}`")
         return
 
+    # 3. ゲーム本編の開始
     if msg == "!ゲーム開始":
         if status != "character_creation":
             await message.channel.send("⚠️ `System: 参加者が1人以上キャラ作成を完了した状態で !ゲーム開始 を宣言してください。`")
             return
+        
         db["session"]["status"] = "playing"
         db["session"]["stage_count"] = 1
         write_db(db)
+        
         await message.channel.send("⚔️ `System: 運命の歯車が回り出した。ゲームを開始します…`")
+        # LLMに最初の部屋と各自の特異スキルを生成させるトリガーを引く
         message_queue.append(f"システム通知: ゲームが本番開始されました。登録されている全プレイヤーの役職に応じた固有スキル（●を●する技術/武器/魔法など）を確定させて !set で保存し、ステージ1の最初の部屋の描写を始めてください。")
         asyncio.create_task(process_queue(message.channel))
         return
 
-    # ── 通常のゲームプレイ ──
+    # ── 通常のゲームプレイ（LLMによるアドリブジャッジ） ──
     if status == "playing":
-        # 新しい通常発言があった場合、確認待ちのダイスは自動でキャンセル（上書き）される
-        if db["session"]["pending_dice"]:
-            db["session"]["pending_dice"] = None
-            write_db(db)
-            
+        # 誰が発言したかを明記してキューに格納
         formatted_msg = f"[{p_name}]: {msg}"
         message_queue.append(formatted_msg)
         if not is_processing:
