@@ -32,13 +32,13 @@ def get_default_db():
             "stage_count": 0,
             "status": "setup",
             "turn_left": 4,
-            "log_history": [],
+            "log_history": [],  # GMの描写履歴を保存するバッファ
             "pending_dice": None
         },
         "players": {},
         "current_event": {
             "title": "ロビー",
-            "description": "ゲームが初期化されました。`!キャラ作成 [希望の役職]` と発言して参加してください。\n全員の作成が終わったら `!ゲーム開始` と発言してください。",
+            "description": "ゲームが初期化されました。`!キャラ作成 [希望の役職] [スキル:技名]` と発言して参加してください。\n全員の作成が終わったら `!ゲーム開始` と発言してください。",
             "truth": "なし",
             "status": "resolved"
         }
@@ -67,9 +67,9 @@ async def execute_commands(commands_text, channel):
             print("[Warning] LLMの不正ダイス出力を検知。ブロックしました。")
             commands_text = "!chat gm ⚠️ (思考エラーを検知しました。プレイヤーは行動を再宣言してください)"
 
-    # 【重要】もしGeminiの出力に!chat自体が含まれていなかった場合の救済措置
+    # もしGeminiの出力に表示コマンド自体が含まれていなかった場合の救済措置
     if "!chat" not in commands_text and "!propose_dice" not in commands_text:
-        commands_text += f"\n!chat gm …静寂が通路を包んでいる。あなたの行動に対して、まだ明確な変化は見られないようだ。(次の行動をどうぞ)"
+        commands_text += f"\n!chat gm …不気味な静寂が満ちている。あなたの行動に対して、まだ周囲に明確な変化は見られないようだ。(次の行動をどうぞ)"
 
     lines = commands_text.strip().split('\n')
     db = get_db_snapshot()
@@ -93,6 +93,15 @@ async def execute_commands(commands_text, channel):
             speaker = sub_args[0].upper()
             msg = sub_args[1] if len(sub_args) > 1 else ""
             
+            # コンテキスト保持のため、GMの発言履歴をDBに蓄積（最大10件）
+            if speaker == "GM":
+                history = db["session"].get("log_history", [])
+                history.append(msg)
+                if len(history) > 10:
+                    history.pop(0)
+                db["session"]["log_history"] = history
+                write_db(db)
+
             # 常時ステータス表示の生成
             status_bars = []
             for p_key, p_val in db["players"].items():
@@ -156,7 +165,7 @@ async def execute_commands(commands_text, channel):
                 confirm_msg = (
                     f"⚠️ **【ダイス判定の確認】**\n"
                     f"**{p_name}** の「{action_desc}」の判定を提案します。\n\n"
-                    f"🎲 使用ステータス: **{stat_name}** (現在値: {base_stat})\n"
+                    f"🎲 使用ステータス: **{stat_name}** (能力値: {base_stat})\n"
                     f"🧭 判定難易度: {diff_str}\n"
                     f"🎯 成功条件: **{target_val} 以下** (1d100)\n\n"
                     f"本当に実行する場合は **`!実行`** とチャットしてください。\n"
@@ -180,15 +189,16 @@ def call_gemini_gm(player_messages, db_snapshot):
         diff_prompt = "【難易度: レベル3】hard中心。特異スキルを機転を利かせて応用させよ。"
 
     system_instruction = f"""
-    あなたはテキストローグライクRPGの「ゲームマスター（GM）」です。
-    あなたの出力は、すべて「!」から始まるコマンド言語のみで構成されなければなりません。
+    あなたは本格派テキストローグライクRPGの「ゲームマスター（GM）」です。
+    あなたの出力は、すべて「!」から始まるコマンド仕様のみで構成されなければなりません。
     必ずプレイヤーへの描写として `!chat gm <描写内容>` を出力に含めてください。メッセージを空にしてはなりません。
 
-    # 絶対厳守ルール：ダイス判定とターン管理
-    1. あなたは自身でダイスを振ってはなりません。必ず `!propose_dice` を使用してください。
-    2. リスクのない単なる「部屋の観察」「落ちているものを調べる」行動には、絶対にダイスを要求せず、!chat gm で結果を開示してください。
-    3. プレイヤー全員が一通り行動を終えた、または大きなアクションを1回起こしたと判断した場合、必ず `!sub session.turn_left 1` を出力して部屋のリミットを1減らしてください。
-    4. ターンリミット（session.turn_left）が 0 になった場合、!chat gm で「部屋の罠の発動」や「モンスターの奇襲」を発生させ、プレイヤーのHPに固定ダメージ（!sub players.名前.stats.HP 3 など）を与えた上で、状況を変化させてください。
+    # 絶対厳守ルール：一貫性と状態管理の復元
+    1. あなたが過去に出力した描写、開示したアイテム、部屋に存在するオブジェクトの情報は、渡される `log_history` および `current_event` に完全に同期していなければなりません。「さっき見つかったと描写したアイテム」を、次のターンで「存在しない」などと言って矛盾を起こすことは絶対に許されません。
+    2. 新しい部屋に進んだ時は必ず `!set current_event.title <部屋名>`, `!set current_event.description <状況説明>`, `!set current_event.truth <部屋の隠された真相や隠しアイテムの場所>` を実行し、データを同期してください。
+    3. リスクのない単なる「部屋の観察」「落ちているものを調べる」行動には、絶対にダイスを要求せず、!chat gm で結果を即座に開示してください。
+    4. プレイヤー全員が一通り行動を終えた、または大きなアクションを1回起こしたと判断した場合、必ず `!sub session.turn_left 1` を出力して部屋のリミットを1減らしてください。
+    5. ターンリミット（session.turn_left）が 0 になった場合、!chat gm で「部屋の罠の発動」や「モンスターの奇襲」を発生させ、プレイヤーのHPに固定ダメージ（!sub players.名前.stats.HP 3 など）を与えた上で、強制的に状況を変化させて物語を進めてください。
 
     # プレイヤーの職業とスキルの一貫性
     - データベース（DB）に記載されている各プレイヤーの `class` と `skills` を絶対に勝手に変更したり、別の名前に書き換えて描写したりしないでください。DBの情報が絶対の正義です。
@@ -197,7 +207,7 @@ def call_gemini_gm(player_messages, db_snapshot):
     現在の難易度方針: {diff_prompt}
     """
 
-    user_content = f"--- DB ---\n{json.dumps(db_snapshot, indent=2, ensure_ascii=False)}\n\n--- プレイヤー発言 ---\n{'/'.join(player_messages)}"
+    user_content = f"--- DB STATUS ---\n{json.dumps(db_snapshot, indent=2, ensure_ascii=False)}\n\n--- プレイヤー発言 ---\n{'/'.join(player_messages)}"
 
     try:
         response = client.models.generate_content(
@@ -293,32 +303,30 @@ async def on_message(message):
             await message.channel.send("⚠️ `System: 現在はキャラクター作成フェーズではありません。`")
             return
         
-        # クラス名とスキル名を自由に入力できるようにパース
-        # 例: 「!キャラ作成 漆黒の魔導師 スキル:ダークフレア」
-        # スキル指定がない場合は自動でデフォルト設定
-        input_text = msg.replace("!キャラ作成", "").strip()
-        job_name = "冒険者"
-        skill_name = "渾身の一撃"
-        skill_effect = "SPを3消費し、強力な一撃を放つ"
+        # 全角スペース、全角コロンを半角に統一してパースの崩れを防止
+        raw_input = msg.replace("!キャラ作成", "").replace(" ", " ").replace("：", ":").strip()
         
-        if "スキル:" in input_text:
-            parts = input_text.split("スキル:")
+        job_name = "冒険者"
+        skill_name = "未覚醒"
+        
+        # 「スキル:」の文字列をベースに賢くパース
+        if "スキル:" in raw_input:
+            parts = raw_input.split("スキル:")
             job_name = parts[0].strip()
             skill_name = parts[1].strip()
-        elif " " in input_text:
-            parts = input_text.split(" ", 1)
+        elif " " in raw_input:
+            parts = raw_input.split(" ", 1)
             job_name = parts[0].strip()
             skill_name = parts[1].strip()
-        elif input_text:
-            job_name = input_text
-            # 職業名からそれっぽいスキルを自動割当（最低限の配慮）
-            if any(k in job_name for k in ["魔", "僧", "神", "癒"]):
-                skill_name = "マジックバースト"
+        elif raw_input:
+            job_name = raw_input
+            if any(k in job_name for k in ["魔", "僧", "神", "癒", "学"]):
+                skill_name = "精神集中"
             else:
                 skill_name = "ブレイブスラッシュ"
 
-        # 職業名からMPかSPかを自動判定するロジック
-        if any(k in job_name or k in skill_name for k in ["魔法", "魔導", "魔剣", "神官", "僧侶", "ヒール", "癒", "呪"]):
+        # 職業名やスキル名からMP（魔法・知性系）かSP（物理系）かを自動判定
+        if any(k in job_name or k in skill_name for k in ["魔法", "魔導", "魔剣", "神官", "僧侶", "ヒール", "癒", "呪", "学者", "鑑定", "知識"]):
             res_type = "MP"
             skill_effect = f"MPを3消費し、その能力を発動する"
         else:
@@ -344,9 +352,10 @@ async def on_message(message):
         db["session"]["status"] = "playing"
         db["session"]["stage_count"] = 1
         db["session"]["turn_left"] = 4
+        db["session"]["log_history"] = [] # 履歴の初期化
         write_db(db)
         await message.channel.send("⚔️ `System: 運命の歯車が回り出した。ゲームを開始します…`")
-        message_queue.append(f"システム通知: ゲームが開始されました。ステージ1の最初の部屋の描写を始めてください。必ず『埃をかぶった木箱』『古い棚』『不自然な石の窪み』など、探索可能な具体的オブジェクトを最低3つ明文化して含めてください。")
+        message_queue.append(f"システム通知: ゲームが開始されました。ステージ1の最初の部屋の描写を始めてください。必ず!set current_event.title などを実行し、『埃をかぶった木箱』『古い棚』『不自然な石の窪み』など、探索可能な具体的オブジェクトを最低3つ明文化して含めてください。")
         asyncio.create_task(process_queue(message.channel))
         return
 
