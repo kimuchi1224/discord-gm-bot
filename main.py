@@ -26,12 +26,20 @@ DB_FILE = "database.json"
 message_queue = []
 is_processing = False
 
+# 職業と固定スキルの定義テーブル（Geminiの捏造を防止）
+JOB_PRESETS = {
+    "戦士": {"skill_name": "渾身の一撃", "effect": "大ダメージの物理攻撃（消費: 3 SP）", "resource": "SP"},
+    "魔法使い": {"skill_name": "ファイアボール", "effect": "激しい炎を放つ魔法（消費: 3 MP）", "resource": "MP"},
+    "盗賊": {"skill_name": "隠密・罠解除", "effect": "罠の発見や解除の難易度を下げる（消費: 2 SP）", "resource": "SP"},
+    "神官": {"skill_name": "ヒール", "effect": "味方一人のHPを5回復する（消費: 3 MP）", "resource": "MP"}
+}
+
 def get_default_db():
     return {
         "session": {
             "stage_count": 0,
             "status": "setup",
-            "turn_left": 3,  # 各部屋での残り行動回数（タイムリミット）
+            "turn_left": 3,  # 部屋の残り活動限界
             "log_history": [],
             "pending_dice": None
         },
@@ -61,11 +69,10 @@ def write_db(data):
 
 # --- コマンド実行エンジン ---
 async def execute_commands(commands_text, channel):
-    # LLMが勝手にダイス判定の結果を描写しようとした場合のハルシネーション迎撃
     if "🎲" in commands_text or "判定" in commands_text and "目標値" in commands_text:
         if "!propose_dice" not in commands_text:
             print("[Warning] LLMの不正ダイス出力を検知。ブロックしました。")
-            commands_text = "!chat gm ⚠️ (GMが思考エラーを起こしました。行動を再宣言してください)"
+            commands_text = "!chat gm ⚠️ (思考エラーを検知しました。プレイヤーは行動を再宣言してください)"
 
     lines = commands_text.strip().split('\n')
     db = get_db_snapshot()
@@ -89,18 +96,17 @@ async def execute_commands(commands_text, channel):
             speaker = sub_args[0].upper()
             msg = sub_args[1] if len(sub_args) > 1 else ""
             
-            # ── HP / MP・SP の状態バーを自動生成 ──
             status_bars = []
             for p_key, p_val in db["players"].items():
                 p_stats = p_val["stats"]
-                resource_name = "MP" if "魔法" in p_val["class"] or "神官" in p_val["class"] else "SP"
-                status_bars.append(f"👤 **{p_key}** [{p_val['class']}] HP:{p_stats['HP']}/20 | {resource_name}:{p_stats.get(resource_name, 10)}/10")
+                res_type = p_val["skills"]["resource"]
+                status_bars.append(f"👤 **{p_key}** [{p_val['class']}] HP:{p_stats['HP']}/20 | {res_type}:{p_stats.get(res_type, 10)}/10\n   ↳ 技: **{p_val['skills']['name']}** ({p_val['skills']['effect']})")
             status_str = "\n".join(status_bars)
 
             if stage > 0:
                 header = (
                     f"━ [{speaker}] ━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📍 **STAGE {stage}/20 : {event_title}** (⏳部屋の残り活動限界: **{turn_left}** 回)\n"
+                    f"📍 **STAGE {stage}/20 : {event_title}** (⏳部屋のリミット: **{turn_left}** 行動)\n"
                     f"{status_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 )
@@ -131,7 +137,6 @@ async def execute_commands(commands_text, channel):
                 player_data = db["players"].get(p_name, {})
                 base_stat = player_data.get("stats", {}).get(stat_name, 10)
                 
-                # 1d100に完全準拠した難易度自動計算（もうGMに数字は決めさせない）
                 if diff_level == "easy":
                     target_val = min(base_stat * 5, 95)
                     diff_str = "簡単 (能力値×5)"
@@ -157,7 +162,7 @@ async def execute_commands(commands_text, channel):
                     f"🧭 判定難易度: {diff_str}\n"
                     f"🎯 成功条件: **{target_val} 以下** (1d100)\n\n"
                     f"本当に実行する場合は **`!実行`** とチャットしてください。\n"
-                    f"交渉や創意工夫のロールプレイでアプローチを変えれば、難易度が下がる（例: normal ➡️ easy）可能性があります！"
+                    f"交渉や創意工夫、道具の使用などを提案すれば、難易度が下がる可能性があります！"
                 )
                 await channel.send(f"```yaml\n{confirm_msg}\n```")
 
@@ -170,29 +175,24 @@ def call_gemini_gm(player_messages, db_snapshot):
     stage = db_snapshot.get("session", {}).get("stage_count", 1)
     
     if stage <= 5:
-        diff_prompt = "【現在の難易度：レベル1】easyまたはnormal中心。基本行動（観察など）はダイス不要。"
+        diff_prompt = "【難易度: レベル1】easy/normal中心。部屋には鍵が隠された具体的なオブジェクト（例: 『古い木箱』『白骨化した死体』『怪しい壁の隙間』など）を最低3つ物理的に配置し、調べれば確実にヒントや鍵が出るようにせよ。"
     elif stage <= 10:
-        diff_prompt = "【現在の難易度：レベル2】罠やギミック。判定は主にnormal。"
+        diff_prompt = "【難易度: レベル2】罠や戦闘。リソースを削るギミックを導入。"
     else:
-        diff_prompt = "【現在の難易度：レベル3】hard中心。特異スキルの応用やとんちでeasyに緩和せよ。"
+        diff_prompt = "【難易度: レベル3】hard中心。特異スキルを機転を利かせて応用させよ。"
 
     system_instruction = f"""
-    あなたはテキストローグライクRPGの「ゲームマスター（GM）」兼「システムコントローラー」です。
+    あなたはテキストローグライクRPGの「ゲームマスター（GM）」です。
     あなたの出力は、すべて「!」から始まるコマンド言語のみで構成されなければなりません。
 
-    # 絶対厳守ルール：ダイス判定の委任
-    1. あなたは自身でダイスを振った結果（例: 出目、成功、失敗というテキスト）を絶対に直接描写してはなりません。
-    2. 判定が必要な場合は、必ず `!propose_dice <プレイヤー名> <STR/INT/DEX> <easy/normal/hard> <行動の要約>` コマンドのみを出力し、システムの確認ダイアログに処理を委ねてください。
+    # 絶対厳守ルール：ダイス判定とターン管理
+    1. あなたは自身でダイスを振ってはなりません。必ず `!propose_dice` を使用してください。
+    2. リスクのない単なる「部屋の観察」「落ちているものを調べる」行動には、絶対にダイスを要求せず、!chat gm で結果（アイテムの発見や手がかり）を開示してください。
+    3. プレイヤー全員が一通り行動を終えた、または大きなアクションを1回起こしたと判断した場合、必ず `!sub session.turn_left 1` を出力して部屋のリミットを1減らしてください。システム側は自動でターンを減らしません。あなた自身がカウントをコントロールしてください。
+    4. ターンリミット（session.turn_left）が 0 になった場合、!chat gm で「部屋の罠の発動」や「モンスターの奇襲」を発生させ、プレイヤーのHPに固定ダメージ（!sub players.名前.stats.HP 3 など）を与えた上で、次の部屋への扉を強制的に開くか、状況を変化させてください。手詰まりのまま放置してはなりません。
 
-    # リソースと行動制限ルール
-    1. プレイヤーが強力な「スキル」や「魔法」を使用した場合、必ずその描写と共に、!sub を用いて対象の MP または SP を 2〜3 ポイント消費させてください（例: !sub players.asanebou_benk.stats.MP 3）。
-    2. プレイヤーが罠にかかったり、ダメージを受けた場合は、必ず !sub を用いて HP を消費させてください。
-    3. 1ステージは「1つの部屋規模」です。プレイヤーが何か具体的な行動（探索、スキル使用、扉を開けるなど）を決定するたびに、!sub session.turn_left 1 を実行して部屋のタイムリミットを削ってください。もし turn_left が 0 になっている場合は、次の!chatで環境ダメージや敵の襲撃などのペナルティイベントを発生させてください。
-
-    # 出力コマンド仕様
-    - !chat gm <メッセージ> : GMの描写。
-    - !propose_dice <プレイヤー名> <ステータス> <easy/normal/hard> <行動の要約> : ダイス確認ダイアログの生成。
-    - !set / !add / !sub <JSONパス> <値> : データの更新。
+    # スキルとリソース消費
+    - プレイヤーが固有スキル・魔法を使用した場合、必ず !sub を用いて、DBに記載されている正しいリソース（MPまたはSP）を消費させてください。
 
     現在の難易度方針: {diff_prompt}
     """
@@ -207,8 +207,14 @@ def call_gemini_gm(player_messages, db_snapshot):
         )
         return response.text if response.text else ""
     except Exception as e:
-        print(f"Gemini Error: {e}")
-        return ""
+        print(f"Gemini API Error: {e}")
+        err_msg = str(e)
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            return "!chat system 🚨 **【APIエラー: 429 RESOURCE_EXHAUSTED】**\nGoogle APIの1日あたりの無料枠上限、またはプリペイドクレジットの残高が枯渇しました。AI Studio (https://aistudio.google.com/) で残高をチャージしてください。"
+        elif "503" in err_msg or "Service Unavailable" in err_msg:
+            return "!chat system 🚨 **【APIエラー: 503 Service Unavailable】**\nGoogleのAIサーバーが一時的に過負荷になっています。10秒〜20秒ほど待ってから再度行動を発言してみてください。"
+        else:
+            return f"!chat system 🚨 **【システムエラー】**\nAPI接続中に予期せぬエラーが発生しました:\n`{err_msg}`"
 
 # --- メッセージキュー処理 ---
 async def process_queue(channel):
@@ -265,26 +271,20 @@ async def on_message(message):
         db["session"]["pending_dice"] = None
         write_db(db)
         
+        # ── 【仕様変更】システム側では自動でターンを減らさない ──
         if is_success:
-            # 成功したら行動ターンを1減らす
-            db["session"]["turn_left"] = max(db["session"].get("turn_left", 3) - 1, 0)
-            write_db(db)
-            llm_output = call_gemini_gm([f"システム通知: プレイヤー {pending['player']} の「{pending['description']}」の判定結果は 出目{roll} で 【成功】 でした。物語を進める描写を出力してください。"], db)
+            llm_output = call_gemini_gm([f"システム通知: プレイヤー {pending['player']} の「{pending['description']}」の判定結果は 出目{roll} で 【成功】 でした。次の展開や部屋の状況変化、アイテム発見などの描写を出力してください。"], db)
             if llm_output:
                 await execute_commands(llm_output, message.channel)
         else:
-            # 失敗しても行動ターンは1減る
-            db["session"]["turn_left"] = max(db["session"].get("turn_left", 3) - 1, 0)
-            write_db(db)
             fail_warn = (
                 f"❌ **判定失敗...**\n"
                 f"{pending['player']} の「{pending['description']}」は失敗に終わった。\n"
-                f"部屋の残り活動限界が減少した！別の方法を試すか、交渉などのロールプレイで打開策を考えてください。"
+                f"まだリミットは消費されていません。別のオブジェクトを調べるか、アプローチを変えてみてください！"
             )
             await message.channel.send(f"```diff\n- {fail_warn}\n```")
             
-            # ターン減少をLLMに同期させるための空たたき
-            llm_output = call_gemini_gm([f"システム通知: {pending['player']}の行動は失敗し、部屋の残り活動限界が {db['session']['turn_left']} になりました。現在の部屋の緊迫感を!chatで描写してください。"], db)
+            llm_output = call_gemini_gm([f"システム通知: {pending['player']}の行動「{pending['description']}」は 出目{roll} で 【失敗】 しました。部屋の状況は変わっていません。失敗の様子をナレーションしてください。※まだターンリミットを減らすコマンド（!sub）は送らないでください。"], db)
             if llm_output:
                 await execute_commands(llm_output, message.channel)
         return
@@ -294,15 +294,23 @@ async def on_message(message):
             await message.channel.send("⚠️ `System: 現在はキャラクター作成フェーズではありません。`")
             return
         job = msg.replace("!キャラ作成", "").strip()
-        if not job: job = "冒険者"
+        if job not in JOB_PRESETS:
+            valid_jobs = " / ".join(JOB_PRESETS.keys())
+            await message.channel.send(f"⚠️ `System: 職業は [{valid_jobs}] から選んで入力してください。`")
+            return
         
-        # HP20, MP/SPは10で一律固定
-        resource_name = "MP" if "魔法" in job or "神官" in job else "SP"
-        stats = {"HP": 20, resource_name: 10, "STR": random.randint(6, 18), "INT": random.randint(6, 18), "DEX": random.randint(6, 18)}
-        db["players"][p_name] = {"class": job, "skills": {"name": "未覚醒", "effect": "開始時に決定"}, "stats": stats}
+        preset = JOB_PRESETS[job]
+        res_type = preset["resource"]
+        stats = {"HP": 20, res_type: 10, "STR": random.randint(6, 18), "INT": random.randint(6, 18), "DEX": random.randint(6, 18)}
+        
+        db["players"][p_name] = {
+            "class": job, 
+            "skills": {"name": preset["skill_name"], "effect": preset["effect"], "resource": res_type}, 
+            "stats": stats
+        }
         db["session"]["status"] = "character_creation"
         write_db(db)
-        await message.channel.send(f"🎲 **{p_name}** が **{job}** としてエントリーしました！\n能力値: `STR:{stats['STR']} / INT:{stats['INT']} / DEX:{stats['DEX']}`")
+        await message.channel.send(f"🎲 **{p_name}** が **{job}** としてエントリーしました！\n能力値: `STR:{stats['STR']} / INT:{stats['INT']} / DEX:{stats['DEX']}`\n初期技: `【{preset['skill_name']}】({preset['effect']})`")
         return
 
     if msg == "!ゲーム開始":
@@ -311,10 +319,10 @@ async def on_message(message):
             return
         db["session"]["status"] = "playing"
         db["session"]["stage_count"] = 1
-        db["session"]["turn_left"] = 3 # 1部屋あたり3行動のリミット
+        db["session"]["turn_left"] = 4 # 初期リミットを4行動に少し緩和
         write_db(db)
         await message.channel.send("⚔️ `System: 運命の歯車が回り出した。ゲームを開始します…`")
-        message_queue.append(f"システム通知: ゲームが開始されました。全プレイヤーの固有スキル（魔法使いなら『ファイアボール（消費: 3 MP）』、戦士なら『渾身の一撃（消費: 3 SP）』のようなリソース消費型）を!setで保存し、ステージ1の最初の部屋の描写を始めてください。")
+        message_queue.append(f"システム通知: ゲームが開始されました。ステージ1の最初の部屋の描写を始めてください。必ず『埃をかぶった木箱』『古い棚』『不自然な石の窪み』など、探索可能な具体的オブジェクトを最低3つ明文化して含めてください。")
         asyncio.create_task(process_queue(message.channel))
         return
 
