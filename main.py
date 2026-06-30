@@ -211,7 +211,7 @@ def call_gemini_gm(player_messages, db_snapshot):
         if "503" in str(e) or "UNAVAILABLE" in str(e):
             return "!chat system ⚠️ **【システムエラー】** Gemini APIのサービスが混み合っています。時間をおいて再送信してください"
         # クォータ枯渇や残高不足のエラー(429)を検知した場合のDiscord通知用フェイクコマンドを返す
-        else if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+        elif "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
             return "!chat system ⚠️ **【システムエラー】** Gemini APIの利用制限またはリソースの不足が発生しています。管理者へ連絡してください"
         return ""
 
