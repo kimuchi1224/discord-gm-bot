@@ -96,6 +96,10 @@ async def execute_commands(commands_text, channel):
             # コンテキスト保持のため、GMの発言履歴をDBに蓄積（最大10件）
             if speaker == "GM":
                 history = db["session"].get("log_history", [])
+                # 安全対策：historyがリスト（配列）になっていない場合は、強制的にリストに変換・初期化する
+                if not isinstance(history, list):
+                    history = [str(history)] if history else []
+                
                 history.append(msg)
                 if len(history) > 10:
                     history.pop(0)
