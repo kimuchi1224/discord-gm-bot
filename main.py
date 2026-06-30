@@ -26,6 +26,14 @@ DB_FILE = "database.json"
 message_queue = []
 is_processing = False
 
+# 職業と固定スキルの定義テーブル（Geminiの捏造を防止）
+JOB_PRESETS = {
+    "戦士": {"skill_name": "渾身の一撃", "effect": "大ダメージの物理攻撃（消費: 3 SP）", "resource": "SP"},
+    "魔法使い": {"skill_name": "ファイアボール", "effect": "激しい炎を放つ魔法（消費: 3 MP）", "resource": "MP"},
+    "盗賊": {"skill_name": "隠密・罠解除", "effect": "罠の発見や解除の難易度を下げる（消費: 2 SP）", "resource": "SP"},
+    "神官": {"skill_name": "ヒール", "effect": "味方一人のHPを5回復する（消費: 3 MP）", "resource": "MP"}
+}
+
 def get_default_db():
     return {
         "session": {
@@ -61,15 +69,13 @@ def write_db(data):
 
 # --- コマンド実行エンジン ---
 async def execute_commands(commands_text, channel):
-    # LLMが勝手にダイス結果を捏造するのを防止
     if "🎲" in commands_text or "判定" in commands_text and "目標値" in commands_text:
         if "!propose_dice" not in commands_text:
             print("[Warning] LLMの不正ダイス出力を検知。ブロックしました。")
             commands_text = "!chat gm ⚠️ (思考エラーを検知しました。プレイヤーは行動を再宣言してください)"
 
-    # もしGeminiの出力に表示コマンド自体が含まれていなかった場合の救済措置
     if "!chat" not in commands_text and "!propose_dice" not in commands_text:
-        commands_text += f"\n!chat gm …不気味な静寂が満ちている。あなたの行動に対して、まだ周囲に明確な変化は見られないようだ。(次の行動をどうぞ)"
+        commands_text += f"\n!chat gm …不気味な静寂が満ちている。(次の行動をどうぞ)"
 
     lines = commands_text.strip().split('\n')
     db = get_db_snapshot()
@@ -78,132 +84,161 @@ async def execute_commands(commands_text, channel):
     turn_left = db["session"].get("turn_left", 4)
     
     for line in lines:
-        line = line.strip()
-        if not line.startswith('!'):
-            continue
-            
-        print(f"[System Command] {line}")
-        match = re.match(r'!([a-z_]+)\s+(.*)', line)
-        if not match:
-            continue
-        command, args_str = match.groups()
-        
-        if command == "chat":
-            sub_args = args_str.split(' ', 1)
-            speaker = sub_args[0].upper()
-            msg = sub_args[1] if len(sub_args) > 1 else ""
-            
-            # コンテキスト保持のため、GMの発言履歴をDBに蓄積（最大10件）
-            if speaker == "GM":
-                history = db["session"].get("log_history", [])
-                # 安全対策：historyがリスト（配列）になっていない場合は、強制的にリストに変換・初期化する
-                if not isinstance(history, list):
-                    history = [str(history)] if history else []
+        try:
+            line = line.strip()
+            if not line.startswith('!'):
+                continue
                 
-                history.append(msg)
-                if len(history) > 10:
-                    history.pop(0)
-                db["session"]["log_history"] = history
-                write_db(db)
+            print(f"[System Command] {line}")
+            match = re.match(r'!([a-z_]+)\s+(.*)', line)
+            if not match:
+                continue
+            command, args_str = match.groups()
+            
+            if command == "chat":
+                sub_args = args_str.split(' ', 1)
+                speaker = sub_args[0].upper()
+                msg = sub_args[1] if len(sub_args) > 1 else ""
+                
+                if speaker == "GM":
+                    history = db["session"].get("log_history", [])
+                    # データベース破損対策: 文字列になっていた場合は強制的にリストへ修復
+                    if isinstance(history, str):
+                        history = [history]
+                    elif not isinstance(history, list):
+                        history = []
+                        
+                    history.append(msg)
+                    if len(history) > 10:
+                        history.pop(0)
+                    db["session"]["log_history"] = history
+                    write_db(db)
 
-            # 常時ステータス表示の生成
-            status_bars = []
-            for p_key, p_val in db["players"].items():
-                p_stats = p_val["stats"]
-                res_type = p_val["skills"]["resource"]
-                status_bars.append(f"👤 **{p_key}** [{p_val['class']}] HP:{p_stats['HP']}/20 | {res_type}:{p_stats.get(res_type, 10)}/10\n   ↳ 技: **{p_val['skills']['name']}** ({p_val['skills']['effect']})")
-            status_str = "\n".join(status_bars)
+                status_bars = []
+                for p_key, p_val in db["players"].items():
+                    p_stats = p_val["stats"]
+                    res_type = p_val["skills"]["resource"]
+                    # インベントリ表示用の補助表示
+                    inv = p_val.get("inventory", [])
+                    inv_str = f" | 💼:{', '.join(inv)}" if inv else ""
+                    status_bars.append(f"👤 **{p_key}** [{p_val['class']}] HP:{p_stats['HP']}/20 | {res_type}:{p_stats.get(res_type, 10)}/10{inv_str}\n   ↳ 技: **{p_val['skills']['name']}** ({p_val['skills']['effect']})")
+                status_str = "\n".join(status_bars)
 
-            if stage > 0:
-                header = (
-                    f"━ [{speaker}] ━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📍 **STAGE {stage}/20 : {event_title}** (⏳部屋のリミット: **{turn_left}** 行動)\n"
-                    f"{status_str}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                )
-            else:
-                header = f"━ [{speaker}] ━━━━━━━━━━\n"
-            await channel.send(f"{header}{msg}")
-            
-        elif command in ["set", "add", "sub"]:
-            sub_args = args_str.split(' ', 1)
-            path, val = sub_args[0], sub_args[1]
-            if val.isdigit(): val = int(val)
-            
-            keys = path.split('.')
-            current = db
-            for key in keys[:-1]:
-                current = current.setdefault(key, {})
-            
-            if command == "set": current[keys[-1]] = val
-            elif command == "add": current[keys[-1]] = current.get(keys[-1], 0) + val
-            elif command == "sub": current[keys[-1]] = current.get(keys[-1], 0) - val
-            write_db(db)
-            
-        elif command == "propose_dice":
-            parts = args_str.split(' ', 3)
-            if len(parts) >= 4:
-                p_names_str, stat_name, diff_level, action_desc = parts[0], parts[1].upper(), parts[2].lower(), parts[3]
-                
-                # 余計な引用符（ハルシネーション）を徹底排除
-                action_desc = action_desc.replace('"', '').replace("'", "").strip()
-                
-                # 協力行動（カンマ区切り）の解析ロジック
-                p_names = [p.strip() for p in p_names_str.split(',')]
-                base_stat = 0
-                valid_p_names = []
-                
-                for p in p_names:
-                    if p in db["players"]:
-                        valid_p_names.append(p)
-                        p_stat = db["players"][p]["stats"].get(stat_name, 10)
-                        if isinstance(p_stat, (int, float)) and p_stat > base_stat:
-                            base_stat = p_stat
-                
-                # 万が一、プレイヤー名やステータス名が崩壊していた場合のセーフティ
-                if not valid_p_names:
-                    valid_p_names = list(db["players"].keys())[:1]
-                    base_stat = 10
-                if stat_name not in ["STR", "INT", "DEX"]:
-                    stat_name = "STR"
-                
-                # 協力行動ボーナス：高い方の能力値をベースにし、人数に応じてプラス補正 (+3)
-                coop_bonus = 0
-                if len(valid_p_names) > 1:
-                    coop_bonus = 3 
-                    base_stat += coop_bonus
-                
-                if diff_level == "easy":
-                    target_val = min(base_stat * 5, 95)
-                    diff_str = "簡単 (能力値×5)"
-                elif diff_level == "hard":
-                    target_val = max(base_stat * 1, 5)
-                    diff_str = "困難 (能力値×1)"
+                if stage > 0:
+                    header = (
+                        f"━ [{speaker}] ━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 **STAGE {stage}/20 : {event_title}** (⏳部屋のリミット: **{turn_left}** 行動)\n"
+                        f"{status_str}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    )
                 else:
-                    target_val = max(min(base_stat * 3, 90), 10)
-                    diff_str = "普通 (能力値×3)"
+                    header = f"━ [{speaker}] ━━━━━━━━━━\n"
+                await channel.send(f"{header}{msg}")
                 
-                display_p_name = ", ".join(valid_p_names)
-                db["session"]["pending_dice"] = {
-                    "player": display_p_name,
-                    "stat": stat_name,
-                    "target": target_val,
-                    "description": action_desc
-                }
+            elif command in ["set", "add", "sub"]:
+                sub_args = args_str.split(' ', 1)
+                path, val = sub_args[0], sub_args[1]
+                
+                # ダブルクォーテーションやシングルクォーテーションを自動サニタイズ
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                elif val.startswith("'") and val.endswith("'"):
+                    val = val[1:-1]
+                
+                # 数値型へ変換可能なら変換
+                if val.isdigit(): 
+                    val = int(val)
+                
+                # 配列インデックス指示(例: log_history[2])などの表記を安全に除去
+                path = re.sub(r'\[\d+\]', '', path)
+                
+                keys = path.split('.')
+                current = db
+                for key in keys[:-1]:
+                    current = current.setdefault(key, {})
+                
+                target_key = keys[-1]
+                
+                if command == "set": 
+                    current[target_key] = val
+                elif command == "add":
+                    # 対象がリスト、または追加するオブジェクトが文字列（非数値）である場合は、リストへ追加（append）として安全に処理
+                    if isinstance(current.get(target_key), list):
+                        current[target_key].append(val)
+                    elif target_key == "inventory" or not isinstance(val, int):
+                        if target_key not in current or not isinstance(current[target_key], list):
+                            current[target_key] = []
+                        current[target_key].append(val)
+                    else:
+                        current[target_key] = current.get(target_key, 0) + val
+                elif command == "sub": 
+                    if isinstance(val, int):
+                        current[target_key] = current.get(target_key, 0) - val
                 write_db(db)
                 
-                coop_str = f"🤝 **【協力行動ボーナス適用！】** (能力値ベースに補正 +{coop_bonus})\n" if coop_bonus > 0 else ""
-                confirm_msg = (
-                    f"⚠️ **【ダイス判定の確認】**\n"
-                    f"**{display_p_name}** の「{action_desc}」の判定を提案します。\n\n"
-                    f"{coop_str}"
-                    f"🎲 使用ステータス: **{stat_name}** (基準能力値: {base_stat})\n"
-                    f"🧭 判定難易度: {diff_str}\n"
-                    f"🎯 成功条件: **{target_val} 以下** (1d100)\n\n"
-                    f"本当に実行する場合は **`!実行`** とチャットしてください。\n"
-                    f"交渉や創意工夫、道具の使用などを提案すれば、難易度が下がる可能性があります！"
-                )
-                await channel.send(f"```yaml\n{confirm_msg}\n```")
+            elif command == "propose_dice":
+                parts = args_str.split(' ', 3)
+                if len(parts) >= 4:
+                    p_names_str, stat_name, diff_level, action_desc = parts[0], parts[1].upper(), parts[2].lower(), parts[3]
+                    
+                    action_desc = action_desc.replace('"', '').replace("'", "").strip()
+                    p_names = [p.strip() for p in p_names_str.split(',')]
+                    base_stat = 0
+                    valid_p_names = []
+                    
+                    for p in p_names:
+                        if p in db["players"]:
+                            valid_p_names.append(p)
+                            p_stat = db["players"][p]["stats"].get(stat_name, 10)
+                            if isinstance(p_stat, (int, float)) and p_stat > base_stat:
+                                base_stat = p_stat
+                    
+                    if not valid_p_names:
+                        valid_p_names = list(db["players"].keys())[:1]
+                        base_stat = 10
+                    if stat_name not in ["STR", "INT", "DEX"]:
+                        stat_name = "STR"
+                    
+                    coop_bonus = 0
+                    if len(valid_p_names) > 1:
+                        coop_bonus = 3 
+                        base_stat += coop_bonus
+                    
+                    if diff_level == "easy":
+                        target_val = min(base_stat * 5, 95)
+                        diff_str = "簡単 (能力値×5)"
+                    elif diff_level == "hard":
+                        target_val = max(base_stat * 1, 5)
+                        diff_str = "困難 (能力値×1)"
+                    else:
+                        target_val = max(min(base_stat * 3, 90), 10)
+                        diff_str = "普通 (能力値×3)"
+                    
+                    display_p_name = ", ".join(valid_p_names)
+                    db["session"]["pending_dice"] = {
+                        "player": display_p_name,
+                        "stat": stat_name,
+                        "target": target_val,
+                        "description": action_desc
+                    }
+                    write_db(db)
+                    
+                    coop_str = f"🤝 **【協力行動ボーナス適用！】** (能力値ベースに補正 +{coop_bonus})\n" if coop_bonus > 0 else ""
+                    confirm_msg = (
+                        f"⚠️ **【ダイス判定の確認】**\n"
+                        f"**{display_p_name}** の「{action_desc}」の判定を提案します。\n\n"
+                        f"{coop_str}"
+                        f"🎲 使用ステータス: **{stat_name}** (基準能力値: {base_stat})\n"
+                        f"🧭 判定難易度: {diff_str}\n"
+                        f"🎯 成功条件: **{target_val} 以下** (1d100)\n\n"
+                        f"本当に実行する場合は **`!実行`** とチャットしてください。\n"
+                        f"さらにアプローチを工夫すれば、自動成功に切り替わる可能性もあります！"
+                    )
+                    await channel.send(f"```yaml\n{confirm_msg}\n```")
+        except Exception as line_error:
+            # 各システムコマンド実行時のエラーをトラップし、システムクラッシュを完全に回避
+            print(f"[System Error] Failed to execute '{line}': {line_error}")
+            await channel.send(f"⚠️ `System Error: コマンド '{line}' の実行中に問題が発生しました。そのままゲームを続けてください。`")
 
 # --- Gemini API 接続 ---
 def call_gemini_gm(player_messages, db_snapshot):
@@ -358,8 +393,8 @@ async def on_message(message):
             await message.channel.send("⚠️ `System: 現在はキャラクター作成フェーズではありません。`")
             return
         
-        # 【全角修正】全角スペース、全角コロンを半角に完全に統一してパース崩れを防止
-        raw_input = msg.replace("!キャラ作成", "").replace("　", " ").replace(" ", " ").replace("：", ":").strip()
+        # 全角スペース、全角コロンを半角に統一してパースの崩れを防止
+        raw_input = msg.replace("!キャラ作成", "").replace("　", " ").replace("：", ":").strip()
         
         job_name = "冒険者"
         skill_name = "未覚醒"
@@ -393,7 +428,8 @@ async def on_message(message):
         db["players"][p_name] = {
             "class": job_name, 
             "skills": {"name": skill_name, "effect": skill_effect, "resource": res_type}, 
-            "stats": stats
+            "stats": stats,
+            "inventory": [] # 最初から空のインベントリリストを確実に紐付ける
         }
         db["session"]["status"] = "character_creation"
         write_db(db)
