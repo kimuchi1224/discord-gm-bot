@@ -207,7 +207,11 @@ def call_gemini_gm(player_messages, db_snapshot):
         )
         return response.text if response.text else ""
     except Exception as e:
-        print(f"Gemini Error: {e}"); return ""
+        print(f"Gemini Error: {e}")
+        # クォータ枯渇や残高不足のエラー(429)を検知した場合のDiscord通知用フェイクコマンドを返す
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            return "!chat system ⚠️ **【システムエラー】** Gemini APIの利用制限またはプリペイド残高不足が発生しています。AI Studioの残高を確認してください。"
+        return ""
 
 # --- メッセージキュー処理 ---
 async def process_queue(channel):
