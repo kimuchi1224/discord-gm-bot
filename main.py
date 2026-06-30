@@ -300,6 +300,16 @@ async def on_message(message):
         init_db(force=True)
         await message.channel.send("🧹 `System: ゲームデータを完全にリセットしました。`")
         return
+    if msg == "!db":
+        if os.path.exists(DB_FILE):
+            # チャットにjsonファイルとしてアップロードして送信
+            await message.channel.send(
+                content="📂 **現在の database.json の中身です：**",
+                file=discord.File(DB_FILE)
+            )
+        else:
+            await message.channel.send("⚠️ `System: データベースファイルが存在しません。`")
+        return
 
     db = get_db_snapshot()
     status = db["session"]["status"]
