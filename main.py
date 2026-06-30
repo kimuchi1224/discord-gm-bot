@@ -279,6 +279,10 @@ def call_gemini_gm(player_messages, db_snapshot):
     - プレイヤーが「二人で協力する」「道具を使う」「もっともな作戦を提案する」など、難易度が下がるべき交渉や提案をしてきた場合、再度ダイスを振らせるのではなく、**ダイスを免除して即座に自動成功**として扱い、`!chat gm` で気持ちよく成功描写を行ってストーリーを進めて構いません。
     - プレイヤーとのチャットによる「難易度緩和の問答」に何度も付き合ってゲームを停滞させないよう、スマートに自動成功へ導いてください。
 
+    # ステージの進行ルール（重要：絶対に守ること）
+    - プレイヤーが部屋の調査を終え、次のステージ（次の部屋、通路、広間など）へ進む描写をする際は、**必ず同時に `!add session.stage_count 1` および `!set session.turn_left 4` を実行し、データベースをステージ進行させてください。** これを怠ると、ステージ数が1のまま変化しなくなります。
+    - プレイヤーが次の部屋に進んだら、新しい部屋名で `!set current_event.title <新しい部屋名>` を実行してください。
+
     # プレイヤーの職業とスキルの一貫性
     - データベース（DB）に記載されている各プレイヤーの `class` と `skills` を絶対に勝手に変更したり、別の名前に書き換えて描写したりしないでください。DBの情報が絶対の正義です。
     - プレイヤーが固有スキル・魔法を使用した場合、必ず !sub を用いて、DBに記載されている正しいリソース（MPまたはSP）を消費させてください。
@@ -425,11 +429,27 @@ async def on_message(message):
             
         stats = {"HP": 20, res_type: 10, "STR": random.randint(6, 18), "INT": random.randint(6, 18), "DEX": random.randint(6, 18)}
         
+        # 役職に応じた「デフォルト初期装備」の設定
+        initial_inventory = ["携帯食料"]
+        normalized_job = job_name.lower()
+        if any(k in normalized_job for k in ["戦士", "剣士", "騎士", "武士", "ナイト", "ファイター"]):
+            initial_inventory = ["さびた大剣", "ボロい鉄盾", "携帯食料"]
+        elif any(k in normalized_job for k in ["魔法", "魔導", "魔術", "ウィザード", "メイジ"]):
+            initial_inventory = ["初心者の杖", "すり切れた魔導書", "携帯食料"]
+        elif any(k in normalized_job for k in ["僧侶", "神官", "シスター", "プリースト", "ヒーラー"]):
+            initial_inventory = ["木製の聖印", "回復の軟膏", "携帯食料"]
+        elif any(k in normalized_job for k in ["盗賊", "シーフ", "暗殺", "アサシン"]):
+            initial_inventory = ["錆びた短剣", "万能針(ピッキングツール)", "携帯食料"]
+        elif any(k in normalized_job for k in ["学者", "賢者", "アルケミスト", "鑑定"]):
+            initial_inventory = ["拡大用の虫眼鏡", "古い白地図", "携帯食料"]
+        else:
+            initial_inventory = ["旅人のナイフ", "使い古したマント", "携帯食料"]
+        
         db["players"][p_name] = {
             "class": job_name, 
             "skills": {"name": skill_name, "effect": skill_effect, "resource": res_type}, 
             "stats": stats,
-            "inventory": [] # 最初から空のインベントリリストを確実に紐付ける
+            "inventory": initial_inventory
         }
         db["session"]["status"] = "character_creation"
         write_db(db)
