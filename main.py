@@ -5,16 +5,18 @@ import re
 import os
 from flask import Flask
 from threading import Thread
+# Google GenAI SDKのインポート
+from google import genai
+from google.genai import types
 
 # --- Flask Webサーバー（Renderのスリープ防止用） ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "GM Bot is Alive!"
+    return "GM Bot is Alive and Learning!"
 
 def run_web():
-    # Renderは自動的にPORT環境変数を割り振るため、それを読み込む（デフォルトは8080）
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -33,7 +35,16 @@ def init_db():
             "session": {"stage_count": 1, "log_history": ["ゲームが開始された。"]},
             "player_character": {
                 "name": "未設定",
-                "stats": {"HP": 20, "STR": 10}
+                "class": "未設定",
+                "skills": {"name": "未設定", "effect": "未設定"},
+                "stats": {"HP": 20, "STR": 10, "INT": 10, "DEX": 10}
+            },
+            "current_event": {
+                "type": "none",
+                "title": "始まりの地",
+                "description": "まだ冒険は始まっていない。『!ゲーム開始』とチャットしてキャラクターを作成しよう。",
+                "truth": "なし",
+                "status": "resolved"
             }
         }
         with open(DB_FILE, 'w', encoding='utf-8') as f:
@@ -41,7 +52,10 @@ def init_db():
 
 init_db()
 
-# --- JSON操作関数（ドット記法対応） ---
+def get_db_snapshot():
+    with open(DB_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
 def update_json_value(path, value, operator="set"):
     with open(DB_FILE, 'r+', encoding='utf-8') as f:
         data = json.load(f)
@@ -93,16 +107,60 @@ async def execute_commands(commands_text, channel):
             update_json_value(path, val, operator=command)
             await channel.send(f"⚙️ `System: DBの {path} を {command} ({val}) しました。`")
 
-# --- 擬似LLM（テスト用ダミー） ---
-def mock_llm_engine(player_messages):
-    combined = " ".join(player_messages)
-    if "開始" in combined:
-        return "!set player_character.name 勇者アルフレッド\n!chat gm ゲームが開始された。\n!chat gm ステージ 1 に進みます。"
-    elif "攻撃" in combined:
-        return "!sub player_character.stats.HP 3\n!chat gm モンスターの反撃！アルフレッドは3ダメージを受けた！"
-    elif "回復" in combined:
-        return "!add player_character.stats.HP 5\n!chat gm 聖なる光が包む。HPが5回復した。"
-    return ""
+# --- 本物のGemini APIエンジン ---
+def call_gemini_gm(player_messages, db_snapshot):
+    # 環境変数からAPIキーを取得してクライアント初期化
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("エラー: GEMINI_API_KEY が設定されていません。")
+        return ""
+        
+    client = genai.Client(api_key=api_key)
+    
+    # AIへの超厳格なシステム指示書（プロンプト）
+    system_instruction = """
+    あなたはテキストローグライクRPGの「ゲームマスター（GM）」兼「システムコントローラー」です。
+    あなたは人間に対して自然言語で直接返答してはなりません。あなたの出力は、すべて以下に定義する「!」から始まるコマンド言語のみで構成されなければなりません。
+
+    # 動作原則
+    1. 介入の閾値: プレイヤーが単なる雑談をしている場合は、何も出力してはならない（空文字を返せ）。プレイヤーが「ゲーム開始」「行動」「探索」「NPCへの会話」を行った時のみコマンドを出力せよ。
+    2. PCへの不干渉: プレイヤーキャラクター(PC)のセリフや行動、心理をあなたが勝手に描写してはならない。
+    3. ダイスの主権: 行動判定が必要な場合、あなた自身がダイスを振るのではなく、!chatコマンドを用いてプレイヤーに「ダイスロール（例: 1d100<=DEX）」を要求せよ。
+
+    # 出力コマンド仕様
+    - !chat <送信先(gmまたはnpc名)> <メッセージ> : DiscordにGMの描写やNPCのセリフを送信する。
+    - !set <JSONパス> <値> : JSONデータベースの値を書き換える。
+    - !add / !sub <JSONパス> <数値> : 数値の増減。
+
+    # イベントルール
+    - プレイヤーが「開始」と言ったら、!set でランダムな能力値（STR, INT, DEXなど）と役職に応じた特異スキルを決定し、!chat で世界観を導入せよ。
+    - 各イベントでは具体的な「解法（真相）」を想定し、プレイヤーの行動がそれに合致しているか、あるいは妥当な水平思考かを厳格にジャッジせよ。
+    - 難易度勾配: 現在のstage_count（1〜100）に応じて、進むほど複雑なギミックを要求せよ。
+    """
+
+    # LLMに渡す現在のコンテキストの構築
+    user_content = f"""
+    --- 現在のデータベース状態 ---
+    {json.dumps(db_snapshot, indent=2, ensure_ascii=False)}
+
+    --- プレイヤーの直前の発言（1秒間のバッファ） ---
+    {" / ".join(player_messages)}
+    """
+
+    try:
+        # 高速・安価・プログラミングに強い gemini-2.5-flash を使用
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2, # ハルシネーションを抑えるため低めに設定
+            ),
+        )
+        return response.text if response.text else ""
+    except Exception as e:
+        print(f"Gemini API エラー: {e}")
+        return ""
 
 # --- メッセージキュー処理 ---
 async def process_queue(channel):
@@ -114,7 +172,12 @@ async def process_queue(channel):
     message_queue.clear()
     is_processing = False
     
-    llm_output = mock_llm_engine(current_batch)
+    # 最新のDB状態を取得
+    db_snapshot = get_db_snapshot()
+    
+    # Gemini APIを呼び出してコマンドを取得
+    llm_output = call_gemini_gm(current_batch, db_snapshot)
+    
     if llm_output:
         await execute_commands(llm_output, channel)
 
@@ -125,7 +188,7 @@ client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready():
-    print(f"🤖 GM Bot 起動完了: {client.user}")
+    print(f"🤖 AI GM Bot 起動完了: {client.user}")
 
 @client.event
 async def on_message(message):
@@ -135,12 +198,8 @@ async def on_message(message):
     if not is_processing:
         asyncio.create_task(process_queue(message.channel))
 
-# --- 起動処理 ---
 if __name__ == "__main__":
-    # Webサーバーを別スレッドで起動
     keep_alive()
-    
-    # Renderの環境変数からトークンを取得してBotを起動
     TOKEN = os.environ.get("DISCORD_TOKEN")
     if TOKEN:
         client.run(TOKEN)
