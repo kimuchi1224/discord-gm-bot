@@ -9,10 +9,10 @@ from threading import Thread
 from google import genai
 from google.genai import types
 
-# --- Flask Webサーバー ---
+# --- Flask Webサーバー（Render対応） ---
 app = Flask('')
 @app.route('/')
-def home(): return "GM Bot is Online!"
+def home(): return "TRPG GM Engine is Online!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -21,18 +21,10 @@ def run_web():
 def keep_alive():
     Thread(target=run_web).start()
 
-# --- JSONデータベース制御 ---
+# --- クラウドデータベース（Supabase / ローカルJSON）接続 ---
 DB_FILE = "database.json"
 message_queue = []
 is_processing = False
-
-# 職業と固定スキルの定義テーブル（Geminiの捏造を防止）
-JOB_PRESETS = {
-    "戦士": {"skill_name": "渾身の一撃", "effect": "大ダメージの物理攻撃（消費: 3 SP）", "resource": "SP"},
-    "魔法使い": {"skill_name": "ファイアボール", "effect": "激しい炎を放つ魔法（消費: 3 MP）", "resource": "MP"},
-    "盗賊": {"skill_name": "隠密・罠解除", "effect": "罠の発見や解除の難易度を下げる（消費: 2 SP）", "resource": "SP"},
-    "神官": {"skill_name": "ヒール", "effect": "味方一人のHPを5回復する（消費: 3 MP）", "resource": "MP"}
-}
 
 def get_default_db():
     return {
@@ -40,7 +32,7 @@ def get_default_db():
             "stage_count": 0,
             "status": "setup",
             "turn_left": 4,
-            "log_history": [],  # GMの描写履歴を保存するバッファ
+            "log_history": [],
             "pending_dice": None
         },
         "players": {},
@@ -52,22 +44,59 @@ def get_default_db():
         }
     }
 
-def init_db(force=False):
-    if force or not os.path.exists(DB_FILE):
+def get_db_snapshot():
+    # Supabase接続を優先試行
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_KEY")
+    if supabase_url and supabase_key:
+        import urllib.request
+        try:
+            url = f"{supabase_url.rstrip('/')}/rest/v1/game_state?id=eq.1"
+            headers = {
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json"
+            }
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                res_data = json.loads(response.read().decode('utf-8'))
+                if res_data:
+                    return res_data[0]["data"]
+        except Exception as e:
+            print(f"[Supabase Read Error] {e} -> Falling back to local JSON")
+
+    # ローカルJSONフォールバック
+    if not os.path.exists(DB_FILE):
         with open(DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(get_default_db(), f, indent=2, ensure_ascii=False)
-
-init_db()
-
-def get_db_snapshot():
     with open(DB_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def write_db(data):
+    # Supabase書き込みを優先試行
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_KEY")
+    if supabase_url and supabase_key:
+        import urllib.request
+        try:
+            url = f"{supabase_url.rstrip('/')}/rest/v1/game_state?id=eq.1"
+            headers = {
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge"
+            }
+            payload = json.dumps({"data": data}).encode('utf-8')
+            req = urllib.request.Request(url, data=payload, headers=headers, method="PATCH")
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return
+        except Exception as e:
+            print(f"[Supabase Write Error] {e} -> Saving to local JSON")
+
+    # ローカルJSONフォールバック
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# --- コマンド実行エンジン ---
 async def execute_commands(commands_text, channel):
     if "🎲" in commands_text or "判定" in commands_text and "目標値" in commands_text:
         if "!propose_dice" not in commands_text:
@@ -102,7 +131,6 @@ async def execute_commands(commands_text, channel):
                 
                 if speaker == "GM":
                     history = db["session"].get("log_history", [])
-                    # データベース破損対策: 文字列になっていた場合は強制的にリストへ修復
                     if isinstance(history, str):
                         history = [history]
                     elif not isinstance(history, list):
@@ -118,16 +146,30 @@ async def execute_commands(commands_text, channel):
                 for p_key, p_val in db["players"].items():
                     p_stats = p_val["stats"]
                     res_type = p_val["skills"]["resource"]
-                    # インベントリ表示用の補助表示
+                    
                     inv = p_val.get("inventory", [])
+                    if isinstance(inv, str):
+                        if inv.startswith('[') and inv.endswith(']'):
+                            try:
+                                inv = json.loads(inv.replace("'", '"'))
+                            except:
+                                inv = [x.strip().replace('"', '').replace("'", "") for x in inv[1:-1].split(',')]
+                        else:
+                            inv = [inv]
+                    elif not isinstance(inv, list):
+                        inv = []
+                    
+                    inv = [str(x).strip() for x in inv if str(x).strip()]
                     inv_str = f" | 💼:{', '.join(inv)}" if inv else ""
+                    
                     status_bars.append(f"👤 **{p_key}** [{p_val['class']}] HP:{p_stats['HP']}/20 | {res_type}:{p_stats.get(res_type, 10)}/10{inv_str}\n   ↳ 技: **{p_val['skills']['name']}** ({p_val['skills']['effect']})")
                 status_str = "\n".join(status_bars)
 
+                stage_display = f"STAGE {stage}/20" if stage < 20 else "FINAL STAGE (20/20)"
                 if stage > 0:
                     header = (
                         f"━ [{speaker}] ━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📍 **STAGE {stage}/20 : {event_title}** (⏳部屋のリミット: **{turn_left}** 行動)\n"
+                        f"📍 **{stage_display} : {event_title}** (⏳部屋のリミット: **{turn_left}** 行動)\n"
                         f"{status_str}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     )
@@ -139,19 +181,15 @@ async def execute_commands(commands_text, channel):
                 sub_args = args_str.split(' ', 1)
                 path, val = sub_args[0], sub_args[1]
                 
-                # ダブルクォーテーションやシングルクォーテーションを自動サニタイズ
                 if val.startswith('"') and val.endswith('"'):
                     val = val[1:-1]
                 elif val.startswith("'") and val.endswith("'"):
                     val = val[1:-1]
                 
-                # 数値型へ変換可能なら変換
                 if val.isdigit(): 
                     val = int(val)
                 
-                # 配列インデックス指示(例: log_history[2])などの表記を安全に除去
                 path = re.sub(r'\[\d+\]', '', path)
-                
                 keys = path.split('.')
                 current = db
                 for key in keys[:-1]:
@@ -162,7 +200,6 @@ async def execute_commands(commands_text, channel):
                 if command == "set": 
                     current[target_key] = val
                 elif command == "add":
-                    # 対象がリスト、または追加するオブジェクトが文字列（非数値）である場合は、リストへ追加（append）として安全に処理
                     if isinstance(current.get(target_key), list):
                         current[target_key].append(val)
                     elif target_key == "inventory" or not isinstance(val, int):
@@ -172,16 +209,21 @@ async def execute_commands(commands_text, channel):
                     else:
                         current[target_key] = current.get(target_key, 0) + val
                 elif command == "sub": 
-                    if isinstance(val, int):
-                        current[target_key] = current.get(target_key, 0) - val
+                    # インベントリからアイテムを削除する特別ロジック（使い回し防止）
+                    if target_key == "inventory" or isinstance(current.get(target_key), list):
+                        if isinstance(current[target_key], list) and val in current[target_key]:
+                            current[target_key].remove(val)
+                    else:
+                        if isinstance(val, int):
+                            current[target_key] = current.get(target_key, 0) - val
                 write_db(db)
                 
             elif command == "propose_dice":
                 parts = args_str.split(' ', 3)
                 if len(parts) >= 4:
                     p_names_str, stat_name, diff_level, action_desc = parts[0], parts[1].upper(), parts[2].lower(), parts[3]
-                    
                     action_desc = action_desc.replace('"', '').replace("'", "").strip()
+                    
                     p_names = [p.strip() for p in p_names_str.split(',')]
                     base_stat = 0
                     valid_p_names = []
@@ -235,12 +277,9 @@ async def execute_commands(commands_text, channel):
                         f"さらにアプローチを工夫すれば、自動成功に切り替わる可能性もあります！"
                     )
                     await channel.send(f"```yaml\n{confirm_msg}\n```")
-        except Exception as line_error:
-            # 各システムコマンド実行時のエラーをトラップし、システムクラッシュを完全に回避
-            print(f"[System Error] Failed to execute '{line}': {line_error}")
-            await channel.send(f"⚠️ `System Error: コマンド '{line}' の実行中に問題が発生しました。そのままゲームを続けてください。`")
+        except Exception as cmd_error:
+            print(f"[Command Execution Failed] Line: '{line}', Error: {cmd_error}")
 
-# --- Gemini API 接続 ---
 def call_gemini_gm(player_messages, db_snapshot):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key: return ""
@@ -287,29 +326,36 @@ def call_gemini_gm(player_messages, db_snapshot):
     - データベース（DB）に記載されている各プレイヤーの `class` と `skills` を絶対に勝手に変更したり、別の名前に書き換えて描写したりしないでください。DBの情報が絶対の正義です。
     - プレイヤーが固有スキル・魔法を使用した場合、必ず !sub を用いて、DBに記載されている正しいリソース（MPまたはSP）を消費させてください。
 
+    # アイテム消費のルール（重要：使い回し防止）
+    - プレイヤーが「古びた鍵」や「古びた石板」などの鍵・イベントアイテムを使用、または「携帯食料」を食べて回復した場合、**必ず即座に `!sub players.名前.inventory <アイテム名>` コマンドを実行して、プレイヤーのインベントリからそのアイテムを削除・消滅させてください。**
+
+    # 突然のダメージ・HP減少における描写ルール（重要）
+    - トラップの発動や敵の襲撃、リミット超過（turn_left=0）などでプレイヤーにダメージ（HP減少）を与えるコマンド（例: `!sub players.名前.stats.HP 3`）を実行する際は、**必ずそのHP減少の正当な理由（崩落が発生した、毒ガスが噴き出した、背後から急襲されたなど）を迫真のナレーションで詳しく描写してください。**唐突に理由なくHPが減ったように見せてはなりません。
+
+    # PVP（プレイヤー間対立）へのTRPG的対応
+    - プレイヤーが「他の仲間の首をはねる」「仲間を攻撃する」などの危険な暴走行動を起こした場合、メタ的に無視したりスルーしたりしてはなりません。
+    - 即座に、攻撃した側には攻撃判定（STRやDEX）、攻撃された側には回避判定（DEX）のための `!propose_dice` を提案し、本当にダメージが発生する緊張感ある展開としてゲーム的に真っ向からジャッジしてください。
+
+    # 【最重要】ステージ20（STAGE 20/20）クライマックス ＆ エンディングルール
+    - ステージが 20 に到達したら、それは神殿の最深部、すなわちラストボスの領域です。
+    - あなたは直ちに「宿命のラストボス（邪悪なクリスタルゴーレム、古代の魔導師など）」を出現させ、決死の決戦を描写してください。
+    - プレイヤーがこのボスを撃破する、あるいは儀式を阻止することに成功した場合、**これまでの冒険の軌跡を称える感動的なマルチエンディング（ハッピーエンド、または自己犠牲の悲劇など）を描写し、ゲームクリアを宣言してください。** 21/20 以降へダラダラとステージを進行させては絶対になりません。
+
     現在の難易度方針: {diff_prompt}
     """
-
     user_content = f"--- DB STATUS ---\n{json.dumps(db_snapshot, indent=2, ensure_ascii=False)}\n\n--- プレイヤー発言 ---\n{'/'.join(player_messages)}"
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=user_content,
-            config=types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.3),
+            config=types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2),
         )
         return response.text if response.text else ""
     except Exception as e:
         print(f"Gemini API Error: {e}")
-        err_msg = str(e)
-        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            return "!chat system 🚨 **【APIエラー: 429】** Googleの無料枠上限、またはクレジット残高が枯渇しました。"
-        elif "503" in err_msg or "Service Unavailable" in err_msg:
-            return "!chat system 🚨 **【APIエラー: 503】** Googleサーバーが一時的に過負荷です。少し待って再試行してください。"
-        else:
-            return f"!chat system 🚨 **【システムエラー】**\n`{err_msg}`"
+        return f"!chat system 🚨 **【システムエラー】**\n`{str(e)}`"
 
-# --- メッセージキュー処理 ---
 async def process_queue(channel):
     global message_queue, is_processing
     is_processing = True
@@ -343,16 +389,6 @@ async def on_message(message):
         init_db(force=True)
         await message.channel.send("🧹 `System: ゲームデータを完全にリセットしました。`")
         return
-    if msg == "!db":
-        if os.path.exists(DB_FILE):
-            # チャットにjsonファイルとしてアップロードして送信
-            await message.channel.send(
-                content="📂 **現在の database.json の中身です：**",
-                file=discord.File(DB_FILE)
-            )
-        else:
-            await message.channel.send("⚠️ `System: データベースファイルが存在しません。`")
-        return
 
     db = get_db_snapshot()
     status = db["session"]["status"]
@@ -372,24 +408,18 @@ async def on_message(message):
         await message.channel.send(f"```diff\n{'+ ' if is_success else '- '}{dice_msg}\n```")
         
         db["session"]["pending_dice"] = None
+        # 【重要】ダイスを実行（挑戦）したため、リミット（行動消費）を自動的に1減らす
+        db["session"]["turn_left"] = max(db["session"].get("turn_left", 4) - 1, 0)
         write_db(db)
         
-        # ── システム側では自動でターンを減らさない ──
         if is_success:
-            llm_output = call_gemini_gm([f"システム通知: プレイヤー {pending['player']} の「{pending['description']}」の判定結果は 出目{roll} で 【成功】 でした。次の展開や部屋の状況変化、アイテム発見などの描写を出力してください。"], db)
-            if llm_output:
-                await execute_commands(llm_output, message.channel)
+            llm_output = call_gemini_gm([f"システム通知: {pending['player']} の「{pending['description']}」の判定結果は 出目{roll} で 【成功】 でした。展開を進めてください。"], db)
+            if llm_output: await execute_commands(llm_output, message.channel)
         else:
-            fail_warn = (
-                f"❌ **判定失敗...**\n"
-                f"{pending['player']} の「{pending['description']}」は失敗に終わった。\n"
-                f"まだリミットは消費されていません。別のオブジェクトを調べるか、アプローチを変えてみてください！"
-            )
+            fail_warn = f"❌ **判定失敗...**\n{pending['player']} の「{pending['description']}」は失敗に終わった。"
             await message.channel.send(f"```diff\n- {fail_warn}\n```")
-            
-            llm_output = call_gemini_gm([f"システム通知: {pending['player']}の行動「{pending['description']}」は 出目{roll} で 【失敗】 しました。状況は変わっていません。失敗の様子をナレーションしてください。※まだターンリミットを減らすコマンド（!sub）は送らないでください。"], db)
-            if llm_output:
-                await execute_commands(llm_output, message.channel)
+            llm_output = call_gemini_gm([f"システム通知: {pending['player']}の行動「{pending['description']}」は 出目{roll} で 【失敗】 しました。次の行動を待つ描写、または状況の緊迫化を描写してください。"], db)
+            if llm_output: await execute_commands(llm_output, message.channel)
         return
 
     if msg.startswith("!キャラ作成"):
@@ -397,13 +427,11 @@ async def on_message(message):
             await message.channel.send("⚠️ `System: 現在はキャラクター作成フェーズではありません。`")
             return
         
-        # 全角スペース、全角コロンを半角に統一してパースの崩れを防止
         raw_input = msg.replace("!キャラ作成", "").replace("　", " ").replace("：", ":").strip()
         
         job_name = "冒険者"
         skill_name = "未覚醒"
         
-        # 「スキル:」の文字列をベースに賢くパース
         if "スキル:" in raw_input:
             parts = raw_input.split("スキル:")
             job_name = parts[0].strip()
@@ -419,7 +447,6 @@ async def on_message(message):
             else:
                 skill_name = "ブレイブスラッシュ"
 
-        # 職業名やスキル名からMP（魔法・知性系）かSP（物理系）かを自動判定
         if any(k in job_name or k in skill_name for k in ["魔法", "魔導", "魔剣", "神官", "僧侶", "ヒール", "癒", "呪", "学者", "鑑定", "知識"]):
             res_type = "MP"
             skill_effect = f"MPを3消費し、その能力を発動する"
@@ -453,17 +480,22 @@ async def on_message(message):
         }
         db["session"]["status"] = "character_creation"
         write_db(db)
-        await message.channel.send(f"🎲 **{p_name}** が **{job_name}** としてエントリーしました！\n能力値: `STR:{stats['STR']} / INT:{stats['INT']} / DEX:{stats['DEX']}`\n初期技: `【{skill_name}】({skill_effect})`")
+        
+        inv_desc = " / ".join(initial_inventory)
+        await message.channel.send(
+            f"🎲 **{p_name}** が **{job_name}** としてエントリーしました！\n"
+            f"能力値: `STR:{stats['STR']} / INT:{stats['INT']} / DEX:{stats['DEX']}`\n"
+            f"初期技: `【{skill_name}】({skill_effect})`\n"
+            f"💼 初期所持品: `[{inv_desc}]`"
+        )
         return
 
     if msg == "!ゲーム開始":
-        if status != "character_creation":
-            await message.channel.send("⚠️ `System: 参加者が1人以上キャラ作成を完了した状態で !ゲーム開始 を宣言してください。`")
-            return
+        if status != "character_creation": return
         db["session"].update({"status": "playing", "stage_count": 1, "turn_left": 4, "log_history": []})
         write_db(db)
-        await message.channel.send("⚔️ `System: 運命の歯車が回り出した。ゲームを開始します…`")
-        message_queue.append(f"システム通知: ゲームが開始されました。ステージ1の最初の部屋の描写を始めてください。必ず!set current_event.title などを実行し、『埃をかぶった木箱』『古い棚』『不自然な石の窪み』など、探索可能な具体的オブジェクトを最低3つ明文化して含めてください。")
+        await message.channel.send("⚔️ `System: ゲームを開始します…`")
+        message_queue.append(f"システム通知: ステージ1開始。オブジェクトを最低3つ配置してください。")
         asyncio.create_task(process_queue(message.channel))
         return
 
@@ -471,9 +503,48 @@ async def on_message(message):
         if db["session"]["pending_dice"]:
             db["session"]["pending_dice"] = None
             write_db(db)
+        
+        # 【物理強制ステージ進行＆ダメージシステム】（スタックバグ完全解決、STAGE20手前まで稼働）
+        if db["session"].get("turn_left", 4) <= 0 and db["session"].get("stage_count", 1) < 20:
+            stage_count = db["session"].get("stage_count", 1) + 1
+            db["session"]["stage_count"] = stage_count
+            db["session"]["turn_left"] = 4 # リミット初期化
             
-        formatted_msg = f"[{p_name}]: {msg}"
-        message_queue.append(formatted_msg)
+            damage_notif = ""
+            for p_key, p_val in db["players"].items():
+                old_hp = p_val["stats"].get("HP", 20)
+                new_hp = max(old_hp - 3, 1)  # 死亡直前まで減らす
+                p_val["stats"]["HP"] = new_hp
+                damage_notif += f"👤 **{p_key}** が 3ダメージを受けた！ (HP: {old_hp} ➡️ {new_hp})\n"
+                
+            write_db(db)
+            
+            warn_embed = (
+                f"🚨 **【活動限界超過：強制エリア移動発動】**\n"
+                f"このエリアを探索する時間が尽きてしまいました！\n"
+                f"突然、部屋に罠が発動し、崩落が発生して全員がダメージを受けました！\n\n"
+                f"{damage_notif}\n"
+                f"💥 その衝撃によって、あなたたちは半ば強制的に次のステージへと押し流されました！"
+            )
+            await message.channel.send(f"```diff\n- {warn_embed}\n```")
+            
+            system_force_msg = (
+                f"システム通知：タイムリミット（turn_left=0）をオーバーしたため、"
+                f"システム側が強制的にプレイヤーにダメージを与えて STAGE {stage_count} に進行させました。"
+                f"これまでの探索エリアは崩落や罠で壊滅しました。あなたたちは命からがら、次の新しい部屋へとたどり着きました。"
+                f"次の新しい部屋名（!set current_event.title）と新しい部屋の状況描写を !chat gm で開始してください。"
+            )
+            message_queue.append(system_force_msg)
+            if not is_processing:
+                asyncio.create_task(process_queue(message.channel))
+            return
+
+        # プレイヤーが「携帯食料」などの使用を宣言した、またはスキルを使用してリソースを減らす行動をした場合、システムで行動消費を1減らす
+        if any(k in msg for k in ["!実行", "スキル", "使う", "攻撃", "破壊", "動かす", "どかす", "食べる", "飲む"]):
+            db["session"]["turn_left"] = max(db["session"].get("turn_left", 4) - 1, 0)
+            write_db(db)
+
+        message_queue.append(f"[{p_name}]: {msg}")
         if not is_processing:
             asyncio.create_task(process_queue(message.channel))
 
